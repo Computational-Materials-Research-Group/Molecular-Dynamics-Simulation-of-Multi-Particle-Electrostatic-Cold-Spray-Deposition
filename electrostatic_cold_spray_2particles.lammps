@@ -1,0 +1,213 @@
+# ============================================
+# ELECTROSTATIC COLD SPRAY DEPOSITION
+# TWO-PARTICLE DEPOSITION - LAMMPS SCRIPT
+# ============================================
+
+# ============================================
+# INITIALIZATION
+# ============================================
+units           metal
+dimension       3
+atom_style      charge
+boundary        p p s
+
+# ============================================
+# SYSTEM SETUP
+# Extended z-upper boundary to 110 to fit second particle
+# Particle 1: center (0,0,40), radius 10 → top at z=50
+# Particle 2: center (0,0,63), radius 10 → gap ~3 Ang above particle 1
+# ============================================
+lattice         fcc 4.05
+region          box block -50 50 -50 50 -20 110
+create_box      1 box
+
+region          substrate block -50 50 -50 50 -20 5
+create_atoms    1 region substrate
+
+region          particle  sphere 0 0 40 10
+create_atoms    1 region particle
+
+region          particle2 sphere 0 0 63 10
+create_atoms    1 region particle2
+
+mass            1 26.9815
+pair_style      eam/alloy
+pair_coeff      * * Al99.eam.alloy Al
+
+# ============================================
+# ENERGY MINIMIZATION
+# ============================================
+minimize        1.0e-4 1.0e-6 1000 10000
+
+# ============================================
+# GROUP DEFINITIONS
+# NOTE: particle2 must be created BEFORE 'mobile' group
+# so that it is automatically included in 'mobile'
+# ============================================
+group           substrate region substrate
+group           particle  region particle
+group           particle2 region particle2
+group           particles union particle particle2
+
+region          bottom block -50 50 -50 50 -20 -15
+group           bottom region bottom
+group           mobile subtract all bottom
+
+# ============================================
+# ASSIGN CHARGES
+# ============================================
+variable        q_particle equal 0.006
+
+set             group substrate charge 0.0
+set             group particle  charge ${q_particle}
+set             group particle2 charge ${q_particle}
+
+# ============================================
+# INITIAL CONDITIONS
+# Both particles released simultaneously with same downward velocity
+# ============================================
+fix             freeze bottom setforce 0.0 0.0 0.0
+
+velocity        particle  set 0.0 0.0 -3.0
+velocity        particle2 set 0.0 0.0 -3.0
+velocity        substrate set 0.0 0.0  0.0
+
+# ============================================
+# ELECTROSTATIC FIELD
+# Applied to both particles via 'particles' group
+# ============================================
+variable        Ez_field equal -5.0e-3
+fix             efield_particle particles efield 0.0 0.0 ${Ez_field}
+
+# ============================================
+# THERMOSTATS
+# fix 1 applies to both particles via 'particles' group (nve)
+# fix 2 applies to substrate only (nvt)
+# ============================================
+compute         mobile_temp mobile temp
+fix             1 particles nve
+fix             2 substrate nvt temp 300 300 0.1
+
+# ============================================
+# EQUILIBRATION
+# ============================================
+thermo          100
+thermo_style    custom step temp c_mobile_temp ke pe etotal press
+
+run             1000
+
+# ============================================
+# STRESS COMPUTATION
+# ============================================
+compute         stress_atom all stress/atom NULL
+
+variable        sxx atom c_stress_atom[1]
+variable        syy atom c_stress_atom[2]
+variable        szz atom c_stress_atom[3]
+variable        sxy atom c_stress_atom[4]
+variable        sxz atom c_stress_atom[5]
+variable        syz atom c_stress_atom[6]
+
+variable        von_mises atom sqrt(0.5*((v_sxx-v_syy)^2+(v_syy-v_szz)^2+(v_szz-v_sxx)^2+6.0*(v_sxy^2+v_sxz^2+v_syz^2)))
+variable        pressure  atom -(v_sxx+v_syy+v_szz)/3.0
+
+# ============================================
+# NEIGHBOR SETTINGS
+# ============================================
+neighbor        2.0 bin
+neigh_modify    delay 0 every 1 check yes
+
+# ============================================
+# OUTPUT SETTINGS
+# ============================================
+thermo          100
+thermo_style    custom step temp c_mobile_temp ke pe etotal press atoms
+
+dump            1 all custom 500 deposition_approach.lammpstrj &
+                id type x y z &
+                c_stress_atom[1] c_stress_atom[2] c_stress_atom[3] &
+                c_stress_atom[4] c_stress_atom[5] c_stress_atom[6] &
+                v_von_mises v_pressure
+dump_modify     1 sort id
+
+dump            2 all custom 500 vonmises.lammpstrj &
+                id type x y z v_von_mises
+dump_modify     2 sort id
+
+# ============================================
+# TIMESTEP
+# ============================================
+timestep        0.001
+
+# ============================================
+# APPROACH PHASE
+# Both particles travel toward substrate together
+# ============================================
+run             2000
+
+# ============================================
+# IMPACT PHASE
+# Higher dump frequency to capture impact detail
+# ============================================
+undump          1
+undump          2
+
+dump            3 all custom 50 impact_detail.lammpstrj &
+                id type x y z v_von_mises v_pressure
+dump_modify     3 sort id
+
+run             4000
+
+# ============================================
+# POST-IMPACT RELAXATION (E-field off)
+# ============================================
+unfix           efield_particle
+undump          3
+
+dump            4 all custom 500 deposition_postimpact.lammpstrj &
+                id type x y z &
+                c_stress_atom[1] c_stress_atom[2] c_stress_atom[3] &
+                c_stress_atom[4] c_stress_atom[5] c_stress_atom[6] &
+                v_von_mises v_pressure
+dump_modify     4 sort id
+
+run             4000
+
+# ============================================
+# FINAL RELAXATION
+# ============================================
+run             3000
+
+# ============================================
+# FINAL ANALYSIS
+# ============================================
+run             0
+
+compute         max_vm    all reduce max v_von_mises
+compute         avg_vm    all reduce ave v_von_mises
+compute         max_press all reduce max v_pressure
+compute         min_press all reduce min v_pressure
+
+run             0
+
+variable        max_vm_val    equal c_max_vm
+variable        avg_vm_val    equal c_avg_vm
+variable        max_press_val equal c_max_press
+variable        min_press_val equal c_min_press
+
+print           "================================================"
+print           "=== ELECTROSTATIC COLD SPRAY RESULTS        ==="
+print           "=== TWO-PARTICLE DEPOSITION                 ==="
+print           "================================================"
+print           "E-field applied (V/Ang):         ${Ez_field}"
+print           "Particle charge per atom (e):    ${q_particle}"
+print           "Maximum von Mises stress: ${max_vm_val} bars"
+print           "Average von Mises stress: ${avg_vm_val} bars"
+print           "Maximum pressure (compression):  ${max_press_val} bars"
+print           "Minimum pressure (tension):      ${min_press_val} bars"
+print           "================================================"
+
+write_data      final_deposited_ecs_2p.data
+write_restart   deposition_ecs_2p.restart
+
+print           "Simulation completed successfully!"
